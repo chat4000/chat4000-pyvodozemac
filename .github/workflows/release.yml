@@ -1,19 +1,13 @@
-# Build prebuilt wheels for every OS+CPU and publish to PyPI on a version tag.
+# Build prebuilt wheels for every OS+CPU and attach them to the GitHub Release on
+# a version tag. Users install a compiled binary with NO Rust toolchain and NO PyPI:
 #
-# Users then `pip install chat4000-pyvodozemac` and get a compiled binary — no
-# Rust toolchain on their machine.
+#   pip install chat4000-pyvodozemac \
+#     --find-links https://github.com/chat4000/chat4000-pyvodozemac/releases/expanded_assets/v0.1.0
 #
-# Publishing uses PyPI "Trusted Publishing" (OIDC) — no API token stored. ONE-TIME
-# PyPI setup (do this once, in the PyPI web UI):
-#   PyPI → your account → Publishing → Add a pending publisher:
-#     PyPI project name: chat4000-pyvodozemac
-#     Owner: chat4000   Repo: chat4000-pyvodozemac
-#     Workflow name: release.yml      Environment: (leave blank)
-# After that, pushing a tag like `v0.1.0` builds + publishes automatically.
+# The public repo's Release hosts the wheels; `--find-links` lets pip auto-pick the
+# right one per platform. No PyPI account or token needed.
 #
-# NOTE: the first run will FAIL at compile until the matrix-sdk-crypto `(verify)`
-# symbols in src/ are reconciled — that's expected; the CI log is exactly the
-# compiler feedback needed to fix them.
+# Branch/PR pushes only build (CI feedback). Push a tag `v0.1.0` to build + attach.
 
 name: release
 
@@ -102,20 +96,30 @@ jobs:
           name: wheels-sdist
           path: dist
 
-  publish:
-    name: Publish to PyPI
+  release:
+    name: Attach wheels to the GitHub Release
     runs-on: ubuntu-latest
-    # Only on a version tag — branch/PR runs just build (CI feedback), never publish.
+    # Only on a version tag — branch/PR runs just build (CI feedback), never release.
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [linux, musllinux, macos, sdist]
-    environment: pypi
     permissions:
-      id-token: write # OIDC for trusted publishing
+      contents: write # to create/update the release + upload assets
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
           merge-multiple: true
           path: dist
-      - name: Publish
-        uses: pypa/gh-action-pypi-publish@release/v1
+      # Attach all built wheels + sdist to the GitHub Release for this tag, so
+      # users `pip install chat4000-pyvodozemac --find-links <release assets url>`
+      # and get a prebuilt wheel — no Rust, no PyPI. Uses the built-in gh CLI +
+      # GITHUB_TOKEN (no third-party action, so org action-policy can't block it).
+      - name: Upload wheels to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "Prebuilt wheels. Install with: pip install chat4000-pyvodozemac --find-links https://github.com/${GITHUB_REPOSITORY}/releases/expanded_assets/${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+          || gh release upload "${GITHUB_REF_NAME}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
