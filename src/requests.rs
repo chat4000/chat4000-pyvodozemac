@@ -6,24 +6,16 @@
 //! drop straight into a gateway `req` frame; when the `resp` comes back the
 //! plugin hands us `{ kind, status, body }` and we re-type it into the ruma
 //! response `mark_request_as_sent` expects.
-//!
-//! ───────────────────────────────────────────────────────────────────────────
-//! ⚠️ COMPILER PASS REQUIRED. Authored offline against the matrix-sdk-crypto 0.11
-//! API *shape* (no network to fetch the crate, no local compile — see BUILD.md).
-//! Symbols marked `(verify)` — notably the `AnyOutgoingRequest` enum path and the
-//! per-variant ruma response types in machine.rs — drift between minors and must
-//! be reconciled on the first networked `cargo build`. The control flow and the
-//! `{id,kind,method,path,body}` contract are correct.
-//! ───────────────────────────────────────────────────────────────────────────
 
-use ruma::api::{MatrixVersion, OutgoingRequest as _, SendAccessToken};
+use ruma::api::{MatrixVersion, OutgoingRequest as RumaOutgoingRequest, SendAccessToken};
+use ruma::events::EventContent; // brings `.event_type()` into scope on event content
 use ruma::TransactionId;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-// (verify) 0.11 enum path; older minors called it `OutgoingRequests`.
-use matrix_sdk_crypto::types::requests::{AnyOutgoingRequest, ToDeviceRequest};
-use matrix_sdk_crypto::OutgoingRequest;
+use matrix_sdk_crypto::types::requests::{
+    AnyOutgoingRequest, OutgoingRequest, RoomMessageRequest, ToDeviceRequest,
+};
 
 use crate::errors::{BindingError, Result};
 
@@ -41,7 +33,7 @@ pub struct GatewayReq {
     pub body: Value,
 }
 
-/// A ruma request lowered to (method, path, body).
+/// A request lowered to (method, path, body).
 struct Lowered {
     method: String,
     path: String,
@@ -51,48 +43,44 @@ struct Lowered {
 /// Lower one `OutgoingRequest` to a gateway-shippable `GatewayReq`.
 pub fn to_gateway_req(req: &OutgoingRequest) -> Result<GatewayReq> {
     let id = req.request_id().to_string();
-    let (kind, method, path, body) = lower_any(req.request())?;
-    Ok(GatewayReq { id, kind, method, path, body })
-}
-
-fn lower_any(inner: &AnyOutgoingRequest) -> Result<(String, String, String, Value)> {
-    Ok(match inner {
-        // The "pure ruma" requests lower uniformly via ruma's OutgoingRequest.
-        AnyOutgoingRequest::KeysUpload(r) => with_kind("keys_upload", lower(r)?),
-        AnyOutgoingRequest::KeysQuery(r) => with_kind("keys_query", lower(r)?),
-        AnyOutgoingRequest::KeysClaim(r) => with_kind("keys_claim", lower(r)?),
-        AnyOutgoingRequest::SignatureUpload(r) => with_kind("signature_upload", lower(r)?),
-        AnyOutgoingRequest::KeysBackup(r) => with_kind("keys_backup", lower(r)?),
-
-        // ToDevice is matrix-sdk-crypto's own struct — build the path by hand.
-        AnyOutgoingRequest::ToDevice(r) => {
-            let (method, path, body) = to_device_parts(r);
-            ("to_device".to_string(), method, path, body)
-        }
-
-        // RoomMessage (e.g. in-room verification).
-        AnyOutgoingRequest::RoomMessage(r) => {
-            let path = format!(
-                "/_matrix/client/v3/rooms/{}/send/{}/{}",
-                r.room_id,
-                r.event_type(),
-                r.txn_id
-            );
-            let body = serde_json::to_value(&r.content)?;
-            ("room_message".to_string(), "PUT".to_string(), path, body)
-        }
+    let (kind, l) = lower_any(req.request())?;
+    Ok(GatewayReq {
+        id,
+        kind: kind.to_string(),
+        method: l.method,
+        path: l.path,
+        body: l.body,
     })
 }
 
-fn with_kind(kind: &str, l: Lowered) -> (String, String, String, Value) {
-    (kind.to_string(), l.method, l.path, l.body)
+fn lower_any(inner: &AnyOutgoingRequest) -> Result<(&'static str, Lowered)> {
+    Ok(match inner {
+        // The "pure ruma" requests lower uniformly via ruma's OutgoingRequest.
+        AnyOutgoingRequest::KeysUpload(r) => ("keys_upload", lower_ruma(r)?),
+        AnyOutgoingRequest::KeysClaim(r) => ("keys_claim", lower_ruma(r)?),
+        AnyOutgoingRequest::SignatureUpload(r) => ("signature_upload", lower_ruma(r)?),
+
+        // KeysQuery is matrix-sdk-crypto's OWN wrapper struct (not a ruma
+        // request), so we build the C-S call by hand from its fields.
+        AnyOutgoingRequest::KeysQuery(r) => ("keys_query", keys_query_parts(r)),
+
+        // ToDevice is matrix-sdk-crypto's own struct — build the path by hand.
+        AnyOutgoingRequest::ToDeviceRequest(r) => ("to_device", to_device_parts(r)),
+
+        // RoomMessage (e.g. in-room verification).
+        AnyOutgoingRequest::RoomMessage(r) => ("room_message", room_message_parts(r)?),
+    })
 }
 
 /// Lower any ruma `OutgoingRequest` to method/path/body by building its HTTP
 /// form against a placeholder base (we keep only the path; the gateway adds the
 /// real host + the socket's access token, so the token here is irrelevant).
-fn lower<R: ruma::api::OutgoingRequest>(r: &R) -> Result<Lowered> {
+///
+/// `try_into_http_request` consumes `self`, so we clone the inner ruma request
+/// (we only hold a shared `&` to it inside the `AnyOutgoingRequest`).
+fn lower_ruma<R: RumaOutgoingRequest + Clone>(r: &R) -> Result<Lowered> {
     let http_req = r
+        .clone()
         .try_into_http_request::<Vec<u8>>(
             "https://gateway.invalid",
             SendAccessToken::IfRequired("placeholder"),
@@ -114,13 +102,50 @@ fn lower<R: ruma::api::OutgoingRequest>(r: &R) -> Result<Lowered> {
     Ok(Lowered { method, path, body })
 }
 
+/// POST /_matrix/client/v3/keys/query from the crypto wrapper's fields.
+fn keys_query_parts(r: &matrix_sdk_crypto::types::requests::KeysQueryRequest) -> Lowered {
+    // device_keys: { <user>: [<device>, ...] }. An empty Vec means "all the
+    // user's devices", which is exactly the C-S API's semantics, so we forward
+    // the map as-is.
+    let mut body = json!({ "device_keys": r.device_keys });
+    if let Some(timeout) = r.timeout {
+        body["timeout"] = json!(timeout.as_millis() as u64);
+    }
+    Lowered {
+        method: "POST".to_string(),
+        path: "/_matrix/client/v3/keys/query".to_string(),
+        body,
+    }
+}
+
 /// PUT …/sendToDevice/{eventType}/{txnId} with `{ "messages": … }`.
-fn to_device_parts(r: &ToDeviceRequest) -> (String, String, Value) {
+fn to_device_parts(r: &ToDeviceRequest) -> Lowered {
     let path = format!(
         "/_matrix/client/v3/sendToDevice/{}/{}",
         r.event_type, r.txn_id
     );
-    ("PUT".to_string(), path, json!({ "messages": r.messages }))
+    Lowered {
+        method: "PUT".to_string(),
+        path,
+        body: json!({ "messages": r.messages }),
+    }
+}
+
+/// PUT …/rooms/{roomId}/send/{eventType}/{txnId} with the content as the body.
+fn room_message_parts(r: &RoomMessageRequest) -> Result<Lowered> {
+    // The event-type string lives in the content (there is no event_type field
+    // on the request itself).
+    let event_type = r.content.event_type().to_string();
+    let path = format!(
+        "/_matrix/client/v3/rooms/{}/send/{}/{}",
+        r.room_id, event_type, r.txn_id
+    );
+    let body = serde_json::to_value(&r.content)?;
+    Ok(Lowered {
+        method: "PUT".to_string(),
+        path,
+        body,
+    })
 }
 
 /// Lower a `/keys/claim` produced by `get_missing_sessions` (it returns the
@@ -129,7 +154,7 @@ pub fn keys_claim_to_gateway(
     txn: &TransactionId,
     req: &ruma::api::client::keys::claim_keys::v3::Request,
 ) -> Result<GatewayReq> {
-    let l = lower(req)?;
+    let l = lower_ruma(req)?;
     Ok(GatewayReq {
         id: txn.to_string(),
         kind: "keys_claim".to_string(),
@@ -141,13 +166,13 @@ pub fn keys_claim_to_gateway(
 
 /// Lower a to-device request produced by `share_room_key`.
 pub fn to_device_to_gateway(r: &ToDeviceRequest) -> Result<GatewayReq> {
-    let (method, path, body) = to_device_parts(r);
+    let l = to_device_parts(r);
     Ok(GatewayReq {
         id: r.txn_id.to_string(),
         kind: "to_device".to_string(),
-        method,
-        path,
-        body,
+        method: l.method,
+        path: l.path,
+        body: l.body,
     })
 }
 

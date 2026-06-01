@@ -34,6 +34,11 @@ matrix-sdk-sqlite = { version = "0.11", default-features = false, features = ["c
 # version split; we still name it for the JSON<->typed parsing at the boundary.
 ruma = { version = "0.12", features = ["client-api-c", "rand"] }
 
+# The `http` crate: ruma's request/response lowering (try_into_http_request /
+# try_from_http_response) is expressed in terms of http::Request/http::Response.
+# ruma 0.12 (ruma-common 0.15) is built on the http 1.x line — pin to match.
+http = "1"
+
 # --- Async runtime ---------------------------------------------------------
 # OlmMachine is async; the binding is called synchronously from Python, so we
 # block_on a small multi-thread runtime per call (GIL released via allow_threads).

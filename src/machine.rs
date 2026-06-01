@@ -16,21 +16,21 @@
 //! ───────────────────────────────────────────────────────────────────────────
 
 use std::collections::BTreeMap;
+use std::mem::ManuallyDrop;
 
 use pyo3::prelude::*;
 use ruma::{
     api::client::sync::sync_events::DeviceLists,
     events::AnyToDeviceEvent,
     serde::Raw,
-    DeviceKeyAlgorithm, OwnedUserId, UInt, UserId,
+    OneTimeKeyAlgorithm, OwnedUserId, UInt, UserId,
 };
 use serde_json::Value;
 use tokio::runtime::Runtime;
 
 use matrix_sdk_crypto::{
-    store::types::Changes, // (verify) only if we need direct store writes; unused for now
-    types::requests::ToDeviceRequest,
-    DecryptionSettings, EncryptionSettings, EncryptionSyncChanges, OlmMachine, TrustRequirement,
+    types::requests::ToDeviceRequest, DecryptionSettings, EncryptionSettings,
+    EncryptionSyncChanges, OlmMachine, TrustRequirement,
 };
 
 use crate::errors::{BindingError, Result};
@@ -39,13 +39,29 @@ use crate::store::open_store;
 
 #[pyclass]
 pub struct PyOlmMachine {
-    inner: OlmMachine,
+    // ManuallyDrop so we control WHEN the OlmMachine (and its SQLite store's
+    // deadpool connection pool) is dropped — inside the Tokio runtime context.
+    // `ManuallyDrop<T>` derefs to `T`, so `self.inner.method()` is unchanged.
+    inner: ManuallyDrop<OlmMachine>,
     rt: Runtime,
 }
 
 impl PyOlmMachine {
     fn user_id(s: &str) -> Result<OwnedUserId> {
         UserId::parse(s).map_err(|e| BindingError::Id(e.to_string()))
+    }
+}
+
+impl Drop for PyOlmMachine {
+    fn drop(&mut self) {
+        // The SQLite crypto store's deadpool pool schedules async cleanup on
+        // drop, which needs a running Tokio reactor. Enter the runtime first,
+        // then drop the machine explicitly — otherwise teardown panics with
+        // "there is no reactor running".
+        let _guard = self.rt.enter();
+        // SAFETY: inner is never used again after this; the surrounding struct
+        // is being dropped.
+        unsafe { ManuallyDrop::drop(&mut self.inner) };
     }
 }
 
@@ -77,7 +93,7 @@ impl PyOlmMachine {
             })
         })?;
 
-        Ok(Self { inner, rt })
+        Ok(Self { inner: ManuallyDrop::new(inner), rt })
     }
 
     /// The device's published identity keys (curve25519 + ed25519), as JSON.
@@ -116,20 +132,20 @@ impl PyOlmMachine {
         let device_lists: DeviceLists =
             serde_json::from_str(changed_devices).map_err(BindingError::from)?;
 
-        // {"signed_curve25519": 50} → BTreeMap<DeviceKeyAlgorithm, UInt>
+        // {"signed_curve25519": 50} → BTreeMap<OneTimeKeyAlgorithm, UInt>
         let raw_counts: BTreeMap<String, u64> =
             serde_json::from_str(one_time_key_counts).map_err(BindingError::from)?;
-        let otk_counts: BTreeMap<DeviceKeyAlgorithm, UInt> = raw_counts
+        let otk_counts: BTreeMap<OneTimeKeyAlgorithm, UInt> = raw_counts
             .into_iter()
-            .filter_map(|(k, v)| UInt::try_from(v).ok().map(|u| (DeviceKeyAlgorithm::from(k), u)))
+            .filter_map(|(k, v)| UInt::try_from(v).ok().map(|u| (OneTimeKeyAlgorithm::from(k), u)))
             .collect();
 
-        let fallback: Option<Vec<DeviceKeyAlgorithm>> = match unused_fallback_keys {
+        let fallback: Option<Vec<OneTimeKeyAlgorithm>> = match unused_fallback_keys {
             Some(s) => Some(
                 serde_json::from_str::<Vec<String>>(s)
                     .map_err(BindingError::from)?
                     .into_iter()
-                    .map(DeviceKeyAlgorithm::from)
+                    .map(OneTimeKeyAlgorithm::from)
                     .collect(),
             ),
             None => None,
@@ -194,8 +210,6 @@ impl PyOlmMachine {
     ) -> PyResult<()> {
         let body_val: Value = serde_json::from_str(body).map_err(BindingError::from)?;
         let http = http_response(status, &body_val)?;
-        let txn = ruma::TransactionId::new(); // placeholder; replaced below
-        let _ = txn;
         let txn_id: ruma::OwnedTransactionId = request_id.into();
 
         py.allow_threads(|| {
@@ -369,7 +383,3 @@ impl PyOlmMachine {
         Ok(())
     }
 }
-
-// Silence the unused import until store-direct writes are needed.
-#[allow(unused_imports)]
-use Changes as _Changes;
