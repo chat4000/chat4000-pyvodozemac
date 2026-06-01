@@ -30,6 +30,13 @@ matrix-sdk-crypto = { version = "0.11", features = ["_disable-minimum-rotation-p
 # the store here: one writer, survives restarts, no lost room keys.
 matrix-sdk-sqlite = { version = "0.11", default-features = false, features = ["crypto-store"] }
 
+# Bundle SQLite statically (compile it from source) instead of linking the
+# system libsqlite3. Required for musllinux/Alpine + aarch64-cross wheels where
+# `-lsqlite3` isn't on the linker path; also makes EVERY wheel self-contained
+# (no runtime dependency on the user's system sqlite). Feature-unifies with the
+# libsqlite3-sys that matrix-sdk-sqlite → rusqlite pulls in.
+libsqlite3-sys = { version = "0.31", features = ["bundled"] }
+
 # Matrix data types. Use the SAME ruma matrix-sdk-crypto re-exports to avoid a
 # version split; we still name it for the JSON<->typed parsing at the boundary.
 ruma = { version = "0.12", features = ["client-api-c", "rand"] }
