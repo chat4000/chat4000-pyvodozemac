@@ -1,0 +1,51 @@
+[package]
+name = "chat4000-pyvodozemac"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Python binding around matrix-sdk-crypto's OlmMachine — the E2EE state machine for the chat4000 Hermes plugin"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+# cdylib → the importable Python extension module (chat4000_pyvodozemac).
+# rlib   → so the crate is also unit-testable from plain `cargo test`.
+name = "chat4000_pyvodozemac"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# --- PyO3: the Python <-> Rust bridge -------------------------------------
+# abi3-py311 builds ONE wheel that works on CPython >=3.11 (matches the
+# plugin's requires-python). extension-module drops libpython linkage so the
+# wheel is portable.
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py311"] }
+
+# --- The crypto state machine we wrap -------------------------------------
+# NOTE (offline build): this crate + its closure (vodozemac, matrix-sdk-common)
+# are NOT in the local cargo cache and require a networked `cargo build`.
+# See BUILD.md. Pin to a known-good release; bump deliberately (the OlmMachine
+# API drifts between minors — re-verify machine.rs signatures on every bump).
+matrix-sdk-crypto = { version = "0.11", features = ["_disable-minimum-rotation-period-ms"] }
+# Durable Olm/Megolm key store (SqliteCryptoStore). The whole point of owning
+# the store here: one writer, survives restarts, no lost room keys.
+matrix-sdk-sqlite = { version = "0.11", default-features = false, features = ["crypto-store"] }
+
+# Matrix data types. Use the SAME ruma matrix-sdk-crypto re-exports to avoid a
+# version split; we still name it for the JSON<->typed parsing at the boundary.
+ruma = { version = "0.12", features = ["client-api-c", "rand"] }
+
+# --- Async runtime ---------------------------------------------------------
+# OlmMachine is async; the binding is called synchronously from Python, so we
+# block_on a small multi-thread runtime per call (GIL released via allow_threads).
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+
+# --- Marshaling ------------------------------------------------------------
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[profile.release]
+# Smaller wheels; the crypto hot path is not our bottleneck (network is).
+opt-level = 2
+lto = "thin"

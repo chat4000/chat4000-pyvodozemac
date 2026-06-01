@@ -1,0 +1,24 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "chat4000-pyvodozemac"
+version = "0.1.0"
+description = "Python binding around matrix-sdk-crypto's OlmMachine for the chat4000 Hermes plugin"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "NeonNode Ltd" }]
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+# The Rust cdylib is the importable module; pure-Python type stubs + helpers
+# live under python/ and ship alongside it.
+module-name = "chat4000_pyvodozemac._native"
+python-source = "python"
+features = ["pyo3/extension-module"]
+strip = true

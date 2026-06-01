@@ -1,0 +1,21 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock        # binary-style crate; lock is resolved at build time in CI
+
+# Python / maturin
+__pycache__/
+*.so
+*.pyd
+/dist
+/build
+*.egg-info/
+.venv/
+
+# crypto store artifacts from local testing — NEVER commit key material
+*.sqlite
+*.sqlite-*
+/.test-store/
+
+# editor / OS
+.DS_Store
